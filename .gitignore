@@ -1,0 +1,16 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dyl
+bin/
+
+# Test / build artifacts
+*.test
+*.out
+dist/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
