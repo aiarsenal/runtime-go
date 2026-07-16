@@ -23,11 +23,11 @@ package tencent
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"strconv"
 	"strings"
 
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
@@ -50,6 +50,7 @@ func init() {
 type Config struct {
 	Mode                string // cvm
 	Region              string
+	Zone                string // ap-beijing-6
 	SecretID            string
 	SecretKey           string
 	VpcID               string
@@ -66,6 +67,7 @@ func FromConfig(cfg runtime.Config) (runtime.Adapter, error) {
 	c := Config{
 		Mode:                str(cfg.Params["mode"]),
 		Region:              str(cfg.Params["region"]),
+		Zone:                str(cfg.Params["zone"]),
 		SecretID:            str(cfg.Params["secretId"]),
 		SecretKey:           str(cfg.Params["secretKey"]),
 		VpcID:               str(cfg.Params["vpcId"]),
@@ -145,6 +147,12 @@ func (a *Adapter) Create(ctx context.Context, spec runtime.InstanceSpec) (string
 	req.ImageId = common.StringPtr(imageID)
 	req.InstanceName = common.StringPtr(instanceName(spec.Name))
 	req.InstanceCount = common.Int64Ptr(1)
+	// Placement（Zone 必填）
+	zone := a.cfg.Zone
+	if zone == "" {
+		zone = a.cfg.Region // 退化：region 当 zone 用（腾讯云 zone 形如 ap-beijing-6）
+	}
+	req.Placement = &tccvm.Placement{Zone: common.StringPtr(zone)}
 	if a.cfg.VpcID != "" {
 		req.VirtualPrivateCloud = &tccvm.VirtualPrivateCloud{
 			VpcId:    common.StringPtr(a.cfg.VpcID),
@@ -172,7 +180,7 @@ func (a *Adapter) Create(ctx context.Context, spec runtime.InstanceSpec) (string
 		}},
 	}
 	if len(spec.Env) > 0 {
-		req.UserData = common.StringPtr(buildUserData(spec.Env))
+		req.UserData = common.StringPtr(buildUserDataB64(spec.Env))
 	}
 
 	resp, err := cli.RunInstances(req)
@@ -364,17 +372,22 @@ func mapCvmState(s string) runtime.State {
 	}
 }
 
-// buildUserData 生成 cloud-init UserData：把 env 写 /etc/aiarsenal-env（CVM 首启 cloud-init 执行）。
+// buildUserData 生成 cloud-init UserData 脚本（明文）。
 func buildUserData(env map[string]string) string {
 	var b strings.Builder
 	b.WriteString("#!/bin/bash\n")
-	b.WriteString("set -e\n")
-	b.WriteString("cat > /etc/aiarsenal-env <<'AIARSENAL_ENV_EOF'\n")
+	b.WriteString("mkdir -p /etc\n")
+	b.WriteString("rm -f /etc/aiarsenal-env\n")
 	for k, v := range env {
-		b.WriteString(k + "=" + strconv.Quote(v) + "\n")
+		safe := strings.ReplaceAll(v, "'", "'\\''")
+		b.WriteString("echo '" + k + "=" + safe + "' >> /etc/aiarsenal-env\n")
 	}
-	b.WriteString("AIARSENAL_ENV_EOF\n")
 	return b.String()
+}
+
+// buildUserDataB64 生成 base64 编码的 UserData（腾讯云 RunInstances 要求 base64）。
+func buildUserDataB64(env map[string]string) string {
+	return base64.StdEncoding.EncodeToString([]byte(buildUserData(env)))
 }
 
 func wrapErr(op string, err error) error {
