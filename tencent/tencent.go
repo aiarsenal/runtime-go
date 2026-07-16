@@ -1,38 +1,46 @@
 // Package tencent 实现 runtime.Adapter，通过腾讯云管理 agent 实例。
 //
-// 支持两种后端（按 Config.Mode 选择）：
-//   - eci（弹性容器实例）：无服务器容器，按秒计费，适合短任务/弹性。
-//   - cvm（云服务器）：常驻虚拟机，适合 webtop 桌面等长驻场景。
-//
-// ⚠️ 本包为接口骨架：实现了 Adapter 全部方法签名，但底层云 API 调用待接入
-// 腾讯云 Go SDK（github.com/tencentcloud/tencentcloud-sdk-go）。
-// 目前 Create/Start 等返回 ErrNotImplemented；接入 SDK 后逐方法填充。
+// 当前实现：CVM（云服务器）后端。CVM 能装桌面(KDE)、能 SSH，覆盖 openclaw gateway +
+// webtop 桌面全部场景。ECI（弹性容器）后端为骨架，待后续补。
 //
 // 配置（Config.Params）：
 //
-//	mode        : "eci" | "cvm"（必填）
-//	region      : 地域，如 ap-guangzhou（必填）
-//	secretId    : 腾讯云 API SecretId（必填，或走环境变量 TENCENTCLOUD_SECRET_ID）
-//	secretKey   : 腾讯云 API SecretKey（必填，或走环境变量 TENCENTCLOUD_SECRET_KEY）
-//	vpcId       : VPC Id
-//	subnetId    : 子网 Id
+//	mode            : "cvm"（必填；"eci" 见 eci.go，待补）
+//	region          : 地域，如 ap-guangzhou（必填）
+//	secretId        : 腾讯云 API SecretId（必填，或 TENCENTCLOUD_SECRET_ID）
+//	secretKey       : 腾讯云 API SecretKey（必填，或 TENCENTCLOUD_SECRET_KEY）
+//	vpcId           : VPC Id
+//	subnetId        : 子网 Id
 //	securityGroupId : 安全组 Id
-//	imageId     : 默认镜像 Id（openclaw/webtop 等）
+//	imageId         : 默认镜像 Id（CVM 镜像 Id，如 img-xxx）
+//	instanceType    : 默认机型（如 SA1.MEDIUM4），可被 spec 覆盖
+//	loginKey        : SSH 登录密钥对 Id（KeyId，如 skey-xxx），用于 Exec/Shell
+//	loginUser       : SSH 登录用户（默认 ubuntu）
+//
+// 实例命名约定：CVM 实例名 = aiarsenal-<instanceID>（与 localdocker 容器名一致）。
+// 反查：按实例名 Filter DescribeInstances 拿 CVM InstanceId。
 package tencent
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"strings"
+
+	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
+	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
+	tccvm "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/cvm/v20170312"
 
 	"github.com/aiarsenal/runtime-go"
 )
 
 const providerName = "tencent"
 
-// ErrNotImplemented 云 API 尚未接入。
-var ErrNotImplemented = errors.New("tencent: cloud API not yet implemented (skeleton adapter)")
+// ErrNotImplemented 该后端/方法尚未实现。
+var ErrNotImplemented = errors.New("tencent: not yet implemented for this backend")
 
 func init() {
 	runtime.Register(providerName, FromConfig)
@@ -40,27 +48,33 @@ func init() {
 
 // Config 腾讯云适配器配置。
 type Config struct {
-	Mode            string // eci / cvm
-	Region          string
-	SecretID        string
-	SecretKey       string
-	VpcID           string
-	SubnetID        string
-	SecurityGroupID string
-	DefaultImageID  string
+	Mode                string // cvm
+	Region              string
+	SecretID            string
+	SecretKey           string
+	VpcID               string
+	SubnetID            string
+	SecurityGroupID     string
+	DefaultImageID      string
+	DefaultInstanceType string
+	LoginKey            string // SSH 密钥对 KeyId
+	LoginUser           string // SSH 登录用户（默认 ubuntu）
 }
 
 // FromConfig 从通用 Config 构造 tencent Adapter。
 func FromConfig(cfg runtime.Config) (runtime.Adapter, error) {
 	c := Config{
-		Mode:            str(cfg.Params["mode"]),
-		Region:          str(cfg.Params["region"]),
-		SecretID:        str(cfg.Params["secretId"]),
-		SecretKey:       str(cfg.Params["secretKey"]),
-		VpcID:           str(cfg.Params["vpcId"]),
-		SubnetID:        str(cfg.Params["subnetId"]),
-		SecurityGroupID: str(cfg.Params["securityGroupId"]),
-		DefaultImageID:  str(cfg.Params["imageId"]),
+		Mode:                str(cfg.Params["mode"]),
+		Region:              str(cfg.Params["region"]),
+		SecretID:            str(cfg.Params["secretId"]),
+		SecretKey:           str(cfg.Params["secretKey"]),
+		VpcID:               str(cfg.Params["vpcId"]),
+		SubnetID:            str(cfg.Params["subnetId"]),
+		SecurityGroupID:     str(cfg.Params["securityGroupId"]),
+		DefaultImageID:      str(cfg.Params["imageId"]),
+		DefaultInstanceType: str(cfg.Params["instanceType"]),
+		LoginKey:            str(cfg.Params["loginKey"]),
+		LoginUser:           str(cfg.Params["loginUser"]),
 	}
 	if c.SecretID == "" {
 		c.SecretID = os.Getenv("TENCENTCLOUD_SECRET_ID")
@@ -68,34 +82,205 @@ func FromConfig(cfg runtime.Config) (runtime.Adapter, error) {
 	if c.SecretKey == "" {
 		c.SecretKey = os.Getenv("TENCENTCLOUD_SECRET_KEY")
 	}
-	if c.Mode == "" || c.Region == "" {
-		return nil, errors.New("tencent: mode and region required")
+	if c.Mode == "" {
+		c.Mode = "cvm"
+	}
+	if c.LoginUser == "" {
+		c.LoginUser = "ubuntu"
+	}
+	if c.Mode != "cvm" {
+		return nil, fmt.Errorf("tencent: mode %q not yet supported (only cvm)", c.Mode)
+	}
+	if c.Region == "" || c.SecretID == "" || c.SecretKey == "" {
+		return nil, errors.New("tencent: region/secretId/secretKey required")
 	}
 	return &Adapter{cfg: c}, nil
 }
 
-// Adapter 腾讯云适配器（骨架）。
+// Adapter 腾讯云 CVM 适配器。
 type Adapter struct{ cfg Config }
+
+// newClient 构造 CVM 客户端。
+func (a *Adapter) newClient() (*tccvm.Client, error) {
+	cred := common.NewCredential(a.cfg.SecretID, a.cfg.SecretKey)
+	cpf := profile.NewClientProfile()
+	cpf.Language = "en-US"
+	return tccvm.NewClient(cred, a.cfg.Region, cpf)
+}
+
+// instanceName CVM 实例名（与 localdocker 容器名约定一致）。
+func instanceName(instanceID string) string { return "aiarsenal-" + instanceID }
 
 func (a *Adapter) Provider() string { return providerName }
 
+// Create 创建 CVM 实例（RunInstances）。返回 instanceID（aiarsenal biz_id）。
 func (a *Adapter) Create(ctx context.Context, spec runtime.InstanceSpec) (string, error) {
-	// TODO: 接入 tencentcloud-sdk-go
-	//   eci  → eciv20180408.RunInstances
-	//   cvm  → cvm20170312.RunInstances
-	return "", ErrNotImplemented
+	if spec.Name == "" {
+		return "", errors.New("tencent: spec.Name required (instance id)")
+	}
+	cli, err := a.newClient()
+	if err != nil {
+		return "", err
+	}
+	imageID := spec.Image
+	if imageID == "" {
+		imageID = a.cfg.DefaultImageID
+	}
+	if imageID == "" {
+		return "", errors.New("tencent: image required (spec.Image or config imageId)")
+	}
+	instType := ""
+	if spec.Labels != nil {
+		instType = spec.Labels["instanceType"] // CVM 机型，如 SA1.MEDIUM4
+	}
+	if instType == "" {
+		instType = a.cfg.DefaultInstanceType
+	}
+	if instType == "" {
+		return "", errors.New("tencent: instanceType required (spec.Labels[instanceType] or config instanceType)")
+	}
+
+	req := tccvm.NewRunInstancesRequest()
+	req.InstanceType = common.StringPtr(instType)
+	req.ImageId = common.StringPtr(imageID)
+	req.InstanceName = common.StringPtr(instanceName(spec.Name))
+	req.InstanceCount = common.Int64Ptr(1)
+	if a.cfg.VpcID != "" {
+		req.VirtualPrivateCloud = &tccvm.VirtualPrivateCloud{
+			VpcId:    common.StringPtr(a.cfg.VpcID),
+			SubnetId: common.StringPtr(a.cfg.SubnetID),
+		}
+	}
+	if a.cfg.SecurityGroupID != "" {
+		req.SecurityGroupIds = common.StringPtrs([]string{a.cfg.SecurityGroupID})
+	}
+	if a.cfg.LoginKey != "" {
+		req.LoginSettings = &tccvm.LoginSettings{KeyIds: common.StringPtrs([]string{a.cfg.LoginKey})}
+	}
+	diskSize := int64(spec.DiskGB)
+	if diskSize <= 0 {
+		diskSize = 50
+	}
+	req.SystemDisk = &tccvm.SystemDisk{
+		DiskType: common.StringPtr("CLOUD_PREMIUM"),
+		DiskSize: common.Int64Ptr(diskSize),
+	}
+	req.HostName = common.StringPtr(spec.Name)
+	req.TagSpecification = []*tccvm.TagSpecification{
+		{ResourceType: common.StringPtr("instance"), Tags: []*tccvm.Tag{
+			{Key: common.StringPtr("aiarsenal-instance-id"), Value: common.StringPtr(spec.Name)},
+		}},
+	}
+	if len(spec.Env) > 0 {
+		req.UserData = common.StringPtr(buildUserData(spec.Env))
+	}
+
+	resp, err := cli.RunInstances(req)
+	if err != nil {
+		return "", fmt.Errorf("tencent RunInstances: %w", err)
+	}
+	if resp.Response == nil || len(resp.Response.InstanceIdSet) == 0 {
+		return "", errors.New("tencent RunInstances: no instance id returned")
+	}
+	return spec.Name, nil
 }
 
-func (a *Adapter) Start(ctx context.Context, instanceID string) error   { return ErrNotImplemented }
-func (a *Adapter) Stop(ctx context.Context, instanceID string) error    { return ErrNotImplemented }
-func (a *Adapter) Restart(ctx context.Context, instanceID string) error { return ErrNotImplemented }
-func (a *Adapter) Remove(ctx context.Context, instanceID string) error  { return ErrNotImplemented }
-func (a *Adapter) Status(ctx context.Context, instanceID string) (*runtime.Status, error) {
-	return nil, ErrNotImplemented
+// Start 启动实例（StartInstances）。
+func (a *Adapter) Start(ctx context.Context, instanceID string) error {
+	cvmID, err := a.lookupCvmID(instanceID)
+	if err != nil {
+		return err
+	}
+	cli, err := a.newClient()
+	if err != nil {
+		return err
+	}
+	req := tccvm.NewStartInstancesRequest()
+	req.InstanceIds = common.StringPtrs([]string{cvmID})
+	_, err = cli.StartInstances(req)
+	return wrapErr("StartInstances", err)
 }
+
+// Stop 停止实例（StopInstances）。
+func (a *Adapter) Stop(ctx context.Context, instanceID string) error {
+	cvmID, err := a.lookupCvmID(instanceID)
+	if err != nil {
+		return err
+	}
+	cli, err := a.newClient()
+	if err != nil {
+		return err
+	}
+	req := tccvm.NewStopInstancesRequest()
+	req.InstanceIds = common.StringPtrs([]string{cvmID})
+	req.StopType = common.StringPtr("SOFT")
+	_, err = cli.StopInstances(req)
+	return wrapErr("StopInstances", err)
+}
+
+// Restart 重启实例（RebootInstances）。
+func (a *Adapter) Restart(ctx context.Context, instanceID string) error {
+	cvmID, err := a.lookupCvmID(instanceID)
+	if err != nil {
+		return err
+	}
+	cli, err := a.newClient()
+	if err != nil {
+		return err
+	}
+	req := tccvm.NewRebootInstancesRequest()
+	req.InstanceIds = common.StringPtrs([]string{cvmID})
+	_, err = cli.RebootInstances(req)
+	return wrapErr("RebootInstances", err)
+}
+
+// Remove 销毁实例（TerminateInstances）。
+func (a *Adapter) Remove(ctx context.Context, instanceID string) error {
+	cvmID, err := a.lookupCvmID(instanceID)
+	if err != nil {
+		return err
+	}
+	cli, err := a.newClient()
+	if err != nil {
+		return err
+	}
+	req := tccvm.NewTerminateInstancesRequest()
+	req.InstanceIds = common.StringPtrs([]string{cvmID})
+	_, err = cli.TerminateInstances(req)
+	return wrapErr("TerminateInstances", err)
+}
+
+// Status 查实例状态（DescribeInstances）→ runtime.Status。
+func (a *Adapter) Status(ctx context.Context, instanceID string) (*runtime.Status, error) {
+	cvmID, err := a.lookupCvmID(instanceID)
+	if err != nil {
+		return nil, err
+	}
+	cli, err := a.newClient()
+	if err != nil {
+		return nil, err
+	}
+	req := tccvm.NewDescribeInstancesRequest()
+	req.InstanceIds = common.StringPtrs([]string{cvmID})
+	resp, err := cli.DescribeInstances(req)
+	if err != nil {
+		return nil, wrapErr("DescribeInstances", err)
+	}
+	if resp.Response == nil || len(resp.Response.InstanceSet) == 0 {
+		return nil, &runtime.ErrNotFound{InstanceID: instanceID}
+	}
+	ins := resp.Response.InstanceSet[0]
+	st := &runtime.Status{InstanceID: instanceID, ContainerID: cvmID}
+	st.State = mapCvmState(sval(ins.InstanceState))
+	if len(ins.PublicIpAddresses) > 0 {
+		st.IP = sval(ins.PublicIpAddresses[0])
+	}
+	return st, nil
+}
+
+// --- 以下方法后续补（SSH/COS/快照等） ---
 
 func (a *Adapter) Exec(ctx context.Context, instanceID string, opts runtime.ExecOpts) ([]byte, error) {
-	// TODO: cvm 经 SSH；eci 经 InvokeCommand（腾讯云 TAT）。
 	return nil, ErrNotImplemented
 }
 
@@ -104,12 +289,10 @@ func (a *Adapter) Logs(ctx context.Context, instanceID string, opts runtime.LogO
 }
 
 func (a *Adapter) Shell(ctx context.Context, instanceID string, opts runtime.ShellOpts) (runtime.ReadWriteCloser, error) {
-	// TODO: cvm 经 SSH websocket；eci 不支持常驻 PTY。
 	return nil, ErrNotImplemented
 }
 
 func (a *Adapter) ListFiles(ctx context.Context, instanceID, p string) ([]runtime.FileEntry, error) {
-	// TODO: 经 COS（文件存对象存储）或 SSH。
 	return nil, ErrNotImplemented
 }
 
@@ -121,40 +304,85 @@ func (a *Adapter) DownloadFile(ctx context.Context, instanceID, p string) (io.Re
 	return nil, ErrNotImplemented
 }
 
-func (a *Adapter) Mkdir(ctx context.Context, instanceID, p string) error {
-	return ErrNotImplemented
-}
-
-func (a *Adapter) RenameFile(ctx context.Context, instanceID, oldPath, newPath string) error {
-	return ErrNotImplemented
-}
-
-func (a *Adapter) DeleteFile(ctx context.Context, instanceID, p string) error {
-	return ErrNotImplemented
-}
+func (a *Adapter) Mkdir(ctx context.Context, instanceID, p string) error                     { return ErrNotImplemented }
+func (a *Adapter) RenameFile(ctx context.Context, instanceID, oldPath, newPath string) error { return ErrNotImplemented }
+func (a *Adapter) DeleteFile(ctx context.Context, instanceID, p string) error                { return ErrNotImplemented }
 
 func (a *Adapter) CreateVolume(ctx context.Context, instanceID, mountPath string, sizeGB int) (string, error) {
-	// TODO: cvm → CreateDisks；eci → 容器实例自带临时盘或挂 CBS。
 	return "", ErrNotImplemented
 }
-
 func (a *Adapter) RemoveVolume(ctx context.Context, volumeID string) error { return ErrNotImplemented }
-
 func (a *Adapter) Backup(ctx context.Context, instanceID, name string) (*runtime.Backup, error) {
-	// TODO: cvm → CreateSnapshot；eci → 备份 CBS。
 	return nil, ErrNotImplemented
 }
-
 func (a *Adapter) Inspect(ctx context.Context, instanceID string) (*runtime.InstanceDetail, error) {
 	return nil, ErrNotImplemented
 }
-
 func (a *Adapter) Metrics(ctx context.Context, instanceID string) (*runtime.Metrics, error) {
-	// TODO: 接入 云监控 Monitor。
 	return nil, ErrNotImplemented
 }
 
 func (a *Adapter) Close() error { return nil }
+
+// --- 内部工具 ---
+
+// lookupCvmID 由 aiarsenal instanceID 反查 CVM InstanceId（按实例名 Filter）。
+func (a *Adapter) lookupCvmID(instanceID string) (string, error) {
+	cli, err := a.newClient()
+	if err != nil {
+		return "", err
+	}
+	req := tccvm.NewDescribeInstancesRequest()
+	req.Filters = []*tccvm.Filter{
+		{Name: common.StringPtr("instance-name"), Values: common.StringPtrs([]string{instanceName(instanceID)})},
+	}
+	resp, err := cli.DescribeInstances(req)
+	if err != nil {
+		return "", wrapErr("DescribeInstances(lookup)", err)
+	}
+	if resp.Response == nil || len(resp.Response.InstanceSet) == 0 {
+		return "", &runtime.ErrNotFound{InstanceID: instanceID}
+	}
+	return sval(resp.Response.InstanceSet[0].InstanceId), nil
+}
+
+// mapCvmState CVM InstanceState → runtime.State（0 creating 1 running 2 stopped 3 error 4 deleting）。
+func mapCvmState(s string) runtime.State {
+	switch strings.ToUpper(s) {
+	case "PENDING":
+		return runtime.StateCreating
+	case "LAUNCH_FAILED", "TERMINATING_FAILED":
+		return runtime.StateError
+	case "RUNNING":
+		return runtime.StateRunning
+	case "STOPPED", "STOPPING":
+		return runtime.StateStopped
+	case "TERMINATING":
+		return runtime.StateDeleting
+	default:
+		return runtime.StateRunning
+	}
+}
+
+// buildUserData 生成 cloud-init UserData：把 env 写 /etc/aiarsenal-env（CVM 首启 cloud-init 执行）。
+func buildUserData(env map[string]string) string {
+	var b strings.Builder
+	b.WriteString("#!/bin/bash\n")
+	b.WriteString("set -e\n")
+	b.WriteString("cat > /etc/aiarsenal-env <<'AIARSENAL_ENV_EOF'\n")
+	for k, v := range env {
+		b.WriteString(k + "=" + strconv.Quote(v) + "\n")
+	}
+	b.WriteString("AIARSENAL_ENV_EOF\n")
+	return b.String()
+}
+
+func wrapErr(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("tencent %s: %w", op, err)
+}
 
 func str(v any) string {
 	if v == nil {
@@ -164,4 +392,12 @@ func str(v any) string {
 		return s
 	}
 	return ""
+}
+
+// sval 安全解引用 *string。
+func sval(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }

@@ -5,6 +5,8 @@ go 1.26
 require (
 	github.com/docker/docker v28.5.2+incompatible
 	github.com/docker/go-connections v0.7.0
+	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common v1.3.130
+	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/cvm v1.3.130
 )
 
 require (
