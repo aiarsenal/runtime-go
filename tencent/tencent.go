@@ -29,6 +29,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
@@ -58,6 +59,7 @@ type Config struct {
 	SecurityGroupID     string
 	DefaultImageID      string
 	DefaultInstanceType string
+	BandwidthMbps       int // 公网出带宽上限 Mbps（默认 5）；>0 分配公网 IP，0 不分配
 	LoginKey            string // SSH 密钥对 KeyId
 	LoginUser           string // SSH 登录用户（默认 ubuntu）
 }
@@ -75,6 +77,7 @@ func FromConfig(cfg runtime.Config) (runtime.Adapter, error) {
 		SecurityGroupID:     str(cfg.Params["securityGroupId"]),
 		DefaultImageID:      str(cfg.Params["imageId"]),
 		DefaultInstanceType: str(cfg.Params["instanceType"]),
+		BandwidthMbps:       atoi(str(cfg.Params["bandwidthMbps"])),
 		LoginKey:            str(cfg.Params["loginKey"]),
 		LoginUser:           str(cfg.Params["loginUser"]),
 	}
@@ -173,6 +176,21 @@ func (a *Adapter) Create(ctx context.Context, spec runtime.InstanceSpec) (string
 		DiskType: common.StringPtr("CLOUD_PREMIUM"),
 		DiskSize: common.Int64Ptr(diskSize),
 	}
+	// 公网：按流量后付费 + 分配公网 IP（带宽 >0 才允许分配）。带宽可被 spec.Labels 覆盖。
+	bw := a.cfg.BandwidthMbps
+	if bw <= 0 {
+		bw = 5
+	}
+	if spec.Labels != nil {
+		if n := atoi(spec.Labels["bandwidthMbps"]); n > 0 {
+			bw = n
+		}
+	}
+	req.InternetAccessible = &tccvm.InternetAccessible{
+		InternetChargeType:      common.StringPtr("TRAFFIC_POSTPAID_BY_HOUR"),
+		InternetMaxBandwidthOut: common.Int64Ptr(int64(bw)),
+		PublicIpAssigned:        common.BoolPtr(true),
+	}
 	req.HostName = common.StringPtr(spec.Name)
 	req.TagSpecification = []*tccvm.TagSpecification{
 		{ResourceType: common.StringPtr("instance"), Tags: []*tccvm.Tag{
@@ -205,8 +223,7 @@ func (a *Adapter) Start(ctx context.Context, instanceID string) error {
 	}
 	req := tccvm.NewStartInstancesRequest()
 	req.InstanceIds = common.StringPtrs([]string{cvmID})
-	_, err = cli.StartInstances(req)
-	return wrapErr("StartInstances", err)
+	return retryState("StartInstances", func() error { _, err = cli.StartInstances(req); return err })
 }
 
 // Stop 停止实例（StopInstances）。
@@ -222,8 +239,7 @@ func (a *Adapter) Stop(ctx context.Context, instanceID string) error {
 	req := tccvm.NewStopInstancesRequest()
 	req.InstanceIds = common.StringPtrs([]string{cvmID})
 	req.StopType = common.StringPtr("SOFT")
-	_, err = cli.StopInstances(req)
-	return wrapErr("StopInstances", err)
+	return retryState("StopInstances", func() error { _, err = cli.StopInstances(req); return err })
 }
 
 // Restart 重启实例（RebootInstances）。
@@ -238,8 +254,7 @@ func (a *Adapter) Restart(ctx context.Context, instanceID string) error {
 	}
 	req := tccvm.NewRebootInstancesRequest()
 	req.InstanceIds = common.StringPtrs([]string{cvmID})
-	_, err = cli.RebootInstances(req)
-	return wrapErr("RebootInstances", err)
+	return retryState("RebootInstances", func() error { _, err = cli.RebootInstances(req); return err })
 }
 
 // Remove 销毁实例（TerminateInstances）。
@@ -254,8 +269,7 @@ func (a *Adapter) Remove(ctx context.Context, instanceID string) error {
 	}
 	req := tccvm.NewTerminateInstancesRequest()
 	req.InstanceIds = common.StringPtrs([]string{cvmID})
-	_, err = cli.TerminateInstances(req)
-	return wrapErr("TerminateInstances", err)
+	return retryState("TerminateInstances", func() error { _, err = cli.TerminateInstances(req); return err })
 }
 
 // Status 查实例状态（DescribeInstances）→ runtime.Status。
@@ -397,6 +411,39 @@ func wrapErr(op string, err error) error {
 	return fmt.Errorf("tencent %s: %w", op, err)
 }
 
+// isTransientStateErr 判断是否为「实例状态过渡中」类可重试错误
+// （CVM 的 Start/Stop/Terminate 在实例还在 STARTING/STOPPING/PENDING 时会拒绝）。
+func isTransientStateErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "InstanceStateStart") ||
+		strings.Contains(s, "InstanceStateStop") ||
+		strings.Contains(s, "InstanceStatePending") ||
+		strings.Contains(s, "InternalServerError") ||
+		strings.Contains(s, "RequestLimitExceeded")
+}
+
+// retryState 对实例状态过渡类错误做指数退避重试（5s→10s→15s，最多 ~90s），
+// 消除 CVM 操作的最终一致性竞态。
+func retryState(op string, fn func() error) error {
+	backoff := 5 * time.Second
+	for deadline := time.Now().Add(90 * time.Second); ; {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		if !isTransientStateErr(err) || time.Now().After(deadline) {
+			return wrapErr(op, err)
+		}
+		time.Sleep(backoff)
+		if backoff < 15*time.Second {
+			backoff += 5 * time.Second
+		}
+	}
+}
+
 func str(v any) string {
 	if v == nil {
 		return ""
@@ -405,6 +452,18 @@ func str(v any) string {
 		return s
 	}
 	return ""
+}
+
+// atoi 容错解析 int（空串/非法返回 0）。
+func atoi(s string) int {
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
 }
 
 // sval 安全解引用 *string。
