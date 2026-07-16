@@ -77,7 +77,7 @@ func FromConfig(cfg runtime.Config) (runtime.Adapter, error) {
 		SecurityGroupID:     str(cfg.Params["securityGroupId"]),
 		DefaultImageID:      str(cfg.Params["imageId"]),
 		DefaultInstanceType: str(cfg.Params["instanceType"]),
-		BandwidthMbps:       atoi(str(cfg.Params["bandwidthMbps"])),
+		BandwidthMbps:       toInt(cfg.Params["bandwidthMbps"]),
 		LoginKey:            str(cfg.Params["loginKey"]),
 		LoginUser:           str(cfg.Params["loginUser"]),
 	}
@@ -464,6 +464,21 @@ func atoi(s string) int {
 		n = n*10 + int(c-'0')
 	}
 	return n
+}
+
+// toInt 从 any 取 int（兼容 int/float64/string，来自 Config.Params 的异构值）。
+func toInt(v any) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	case string:
+		return atoi(n)
+	}
+	return 0
 }
 
 // sval 安全解引用 *string。
