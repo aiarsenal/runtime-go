@@ -1,11 +1,11 @@
 // 示例：用 tencent 适配器在腾讯云真起一台 CVM，验证完整生命周期。
 //
-// 配置全部走环境变量（密钥不写死在文件里），便于安全提交。运行：
+// 配置全部走环境变量（不含任何真实账号信息，便于安全提交）。运行：
 //
 //	TC_SECRET_ID=... TC_SECRET_KEY=... \
-//	TC_REGION=ap-beijing TC_ZONE=ap-beijing-6 \
+//	TC_REGION=ap-guangzhou TC_ZONE=ap-guangzhou-3 \
 //	TC_VPC=vpc-xxx TC_SUBNET=subnet-xxx TC_SG=sg-xxx \
-//	TC_IMAGE=img-mmytdhbn TC_INSTANCE_TYPE=SA2.MEDIUM4 \
+//	TC_IMAGE=img-xxxxxxxx TC_INSTANCE_TYPE=SA2.MEDIUM4 \
 //	TC_LOGIN_KEY=skey-xxx TC_LOGIN_USER=ubuntu \
 //	go run ./cmd/tencent-verify
 //
@@ -30,8 +30,8 @@ func main() {
 		Type: "tencent",
 		Params: map[string]any{
 			"mode":            "cvm",
-			"region":          env("TC_REGION", "ap-beijing"),
-			"zone":            env("TC_ZONE", "ap-beijing-6"),
+			"region":          env("TC_REGION", "ap-guangzhou"),
+			"zone":            env("TC_ZONE", "ap-guangzhou-3"),
 			"secretId":        mustEnv("TC_SECRET_ID"),
 			"secretKey":       mustEnv("TC_SECRET_KEY"),
 			"vpcId":           env("TC_VPC", ""),

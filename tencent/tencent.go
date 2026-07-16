@@ -51,7 +51,7 @@ func init() {
 type Config struct {
 	Mode                string // cvm
 	Region              string
-	Zone                string // ap-beijing-6
+	Zone                string // 可用区，如 ap-guangzhou-3
 	SecretID            string
 	SecretKey           string
 	VpcID               string
@@ -153,7 +153,7 @@ func (a *Adapter) Create(ctx context.Context, spec runtime.InstanceSpec) (string
 	// Placement（Zone 必填）
 	zone := a.cfg.Zone
 	if zone == "" {
-		zone = a.cfg.Region // 退化：region 当 zone 用（腾讯云 zone 形如 ap-beijing-6）
+		zone = a.cfg.Region // 退化：region 当 zone 用（腾讯云 zone 形如 ap-guangzhou-3）
 	}
 	req.Placement = &tccvm.Placement{Zone: common.StringPtr(zone)}
 	if a.cfg.VpcID != "" {
