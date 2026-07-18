@@ -197,8 +197,10 @@ func (a *Adapter) Create(ctx context.Context, spec runtime.InstanceSpec) (string
 			{Key: common.StringPtr("aiarsenal-instance-id"), Value: common.StringPtr(spec.Name)},
 		}},
 	}
-	if len(spec.Env) > 0 {
-		req.UserData = common.StringPtr(buildUserDataB64(spec.Env))
+	// cloud-init UserData：写控制面 env 到 /etc/aiarsenal-env；
+	// spec.Labels["installDocker"]=="true" 时附带 Docker 安装（桌面/容器化实例用）。
+	if ud := buildCloudInit(spec.Env, spec.Labels["installDocker"] == "true"); ud != "" {
+		req.UserData = common.StringPtr(base64.StdEncoding.EncodeToString([]byte(ud)))
 	}
 
 	resp, err := cli.RunInstances(req)
@@ -386,10 +388,20 @@ func mapCvmState(s string) runtime.State {
 	}
 }
 
-// buildUserData 生成 cloud-init UserData 脚本（明文）。
-func buildUserData(env map[string]string) string {
+// buildCloudInit 生成 cloud-init UserData 脚本（明文）。
+// 写控制面 env 到 /etc/aiarsenal-env；installDocker=true 时附带官方一键装 Docker。
+// env 为空且不装 docker 时返回空串（不设 UserData）。
+func buildCloudInit(env map[string]string, installDocker bool) string {
+	if !installDocker && len(env) == 0 {
+		return ""
+	}
 	var b strings.Builder
 	b.WriteString("#!/bin/bash\n")
+	if installDocker {
+		// 官方一键脚本：装 docker + docker cli，启用 systemd 服务。幂等。
+		b.WriteString("curl -fsSL https://get.docker.com | sh\n")
+		b.WriteString("systemctl enable --now docker\n")
+	}
 	b.WriteString("mkdir -p /etc\n")
 	b.WriteString("rm -f /etc/aiarsenal-env\n")
 	for k, v := range env {
@@ -397,11 +409,6 @@ func buildUserData(env map[string]string) string {
 		b.WriteString("echo '" + k + "=" + safe + "' >> /etc/aiarsenal-env\n")
 	}
 	return b.String()
-}
-
-// buildUserDataB64 生成 base64 编码的 UserData（腾讯云 RunInstances 要求 base64）。
-func buildUserDataB64(env map[string]string) string {
-	return base64.StdEncoding.EncodeToString([]byte(buildUserData(env)))
 }
 
 func wrapErr(op string, err error) error {
