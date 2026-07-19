@@ -79,19 +79,16 @@ type Adapter interface {
 
 // InstanceSpec 创建实例规格。
 type InstanceSpec struct {
-	Name        string            // 实例名（同 owner 下唯一）
-	Type        string            // openclaw / hermes / ubuntu / webtop / custom
-	RuntimeType string            // desktop / shell / gateway
-	Mode        string            // lite / full
-	Image       string            // 镜像引用（localdocker/k8s 用）
-	Cmd         []string          // 启动命令（覆盖镜像默认）
-	CPU         int               // CPU 核数
-	MemoryMB    int               // 内存 MB
-	DiskGB      int               // 磁盘 GB
-	Env         map[string]string // 环境变量
-	Ports       []PortMap         // 端口映射
-	Volumes     []VolumeMount     // 挂载
-	Labels      map[string]string // 标签/注解
+	Name     string            // 实例名（同 owner 下唯一）
+	Image    string            // 镜像引用（localdocker/k8s 用）
+	Cmd      []string          // 启动命令（覆盖镜像默认）
+	CPU      int               // CPU 核数
+	MemoryMB int               // 内存 MB
+	DiskGB   int               // 磁盘 GB
+	Env      map[string]string // 环境变量
+	Ports    []PortMap         // 端口映射
+	Volumes  []VolumeMount     // 挂载
+	Labels   map[string]string // 标签/注解
 }
 
 // PortMap 端口映射（Host:Container）。
@@ -160,10 +157,10 @@ type LogOpts struct {
 
 // ShellOpts 交互式终端选项。
 type ShellOpts struct {
-	Cmd     []string // 默认 /bin/sh 或镜像默认 shell
-	Width   int
-	Height  int
-	Env     map[string]string
+	Cmd    []string // 默认 /bin/sh 或镜像默认 shell
+	Width  int
+	Height int
+	Env    map[string]string
 }
 
 // FileEntry 文件/目录条目。

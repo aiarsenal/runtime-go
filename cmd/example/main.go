@@ -35,7 +35,6 @@ func main() {
 	fmt.Println("==> Create", instanceID)
 	if _, err := adapter.Create(ctx, runtime.InstanceSpec{
 		Name:     instanceID,
-		Type:     "ubuntu",
 		Image:    "alpine:latest",
 		Cmd:      []string{"sleep", "3600"},
 		CPU:      1,

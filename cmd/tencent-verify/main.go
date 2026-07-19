@@ -80,7 +80,6 @@ func run(ctx context.Context, a runtime.Adapter, instanceID string) error {
 	fmt.Println("==> Create", instanceID)
 	if _, err := a.Create(ctx, runtime.InstanceSpec{
 		Name:   instanceID,
-		Type:   "ubuntu",
 		DiskGB: 50,
 		Env:    map[string]string{"AIARSENAL_INSTANCE_ID": instanceID, "AIARSENAL_BASE_URL": "https://api.moyu.cash"},
 		Labels: map[string]string{"instanceType": os.Getenv("TC_INSTANCE_TYPE")},
